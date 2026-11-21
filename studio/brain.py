@@ -253,11 +253,54 @@ def fallback_by_loudness(db, words, n, max_len, duration):
             continue
         if not any(s <= w["s"] <= e for w in words):
             continue
-        picks.append({"start": s, "end": e, "score": 50, "category": "other", "hook": "WAIT FOR IT",
-                      "title": "Loud moment", "description": "", "hashtags": [], "highlight_words": [],
+        picks.append({"start": s, "end": e, "score": 50, "category": "other", "hook": "", "title": "",
+                      "description": "", "hashtags": [], "highlight_words": [],
                       "reason": "Picked by loudness because the AI was unavailable."})
         if len(picks) >= n:
             break
+    return picks
+
+
+def _spoken(words, s, e):
+    return " ".join(w["w"] for w in words if s <= w["s"] < e).strip()
+
+
+def _words_only(text):
+    """Hook, title and post text made from what was said, for when the AI cannot be reached at all.
+    Every clip then still gets its own words instead of the same placeholder on each one."""
+    said = _text(text, 2000)
+    if not said:
+        return {"hook": "WAIT FOR IT", "title": "", "description": ""}
+    first = re.split(r"(?<=[.?!])\s+", said)[0]
+    hook = " ".join(re.sub(r"[^\w'?!]", " ", first).split()[:5])
+    title = first if len(first) <= 70 else first[:67].rsplit(" ", 1)[0] + "…"
+    desc = said if len(said) <= 200 else said[:197].rsplit(" ", 1)[0] + "…"
+    return {"hook": hook.upper() or "WAIT FOR IT", "title": title, "description": f"\u201c{desc}\u201d"}
+
+
+def _describe_fallbacks(picks, words, title, uploader, game, log):
+    """The big "find the moments" call failed, so the moments were picked by loudness. Each one is still given
+    its own hook, title and post text: first by asking the AI about that one short moment (a much smaller
+    question, which often gets through when the big one did not), and otherwise from the words said in it."""
+    ai_ok = config.ai_ready()
+    for p in picks:
+        text = _spoken(words, p["start"], p["end"])
+        got = None
+        if ai_ok and len(text.split()) >= 4:     # fewer words than that and there is nothing to ask about
+            got = describe(text, title, uploader, game=game, purpose="Video: title and hook")
+            if not (got.get("hook") or got.get("title")):
+                got, ai_ok = None, False     # the AI is down; do not wait on it again for every clip
+        if got:
+            keep = {k: p[k] for k in ("start", "end", "score", "reason")}
+            p.update({k: got[k] for k in ("category", "hook", "title", "description", "hashtags", "highlight_words")})
+            p.update(keep)
+        else:
+            p.update(_words_only(text))
+        if not p.get("title"):       # nothing was said: at least say where in the video the moment is
+            m, s = divmod(int(_num(p["start"])), 60)
+            p["title"] = f"{_text(title, 50) or 'Moment'} at {m}:{s:02d}"
+    if picks and not ai_ok:
+        log("The AI could not write titles either, so they were taken from what was said in each clip.")
     return picks
 
 
@@ -275,7 +318,7 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
     lines = make_lines(words, z)
     if not lines:
         return [], {"model": None, "note": "No speech found."}
-    found, used_model, tokens = [], None, 0
+    found, used_model, tokens, tried = [], None, 0, False
     t = 0.0
     windows = []
     while t < duration:
@@ -290,6 +333,7 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
         prompt = (HEAD.format(title=_safe(title) or "unknown", uploader=_safe(uploader) or "unknown", n=per_window)
                   + extra
                   + RULES.format(min_len=min_len, max_len=max_len, transcript=_fmt(chunk)))
+        tried = True
         try:
             out, used_model, spent = ask_ai(prompt, purpose="Video: finding clips")
             tokens += spent
@@ -299,7 +343,9 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
     note = ""
     if not used_model:
         found = fallback_by_loudness(db, words, max_clips, max_len, duration)
-        note = "The AI was unavailable, so clips were picked by loudness only."
+        found = _describe_fallbacks(found, words, title, uploader, game, log)
+        note = ("The AI was unavailable, so clips were picked by loudness only." if tried
+                else "Too little was said for the AI to judge, so clips were picked by loudness.")
     clips = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, duration)
@@ -333,7 +379,7 @@ def find_live_clips(words, z, now, chat=None, title="", uploader="", min_len=15,
     return clips, spent
 
 
-def describe(text, title="", uploader="", game=None, timeout=None):
+def describe(text, title="", uploader="", game=None, timeout=None, purpose="Hand clip: title and hook"):
     """Hook, title and post text for a clip the user cut by hand."""
     blank = {"score": 0, "category": "other", "hook": "", "title": "", "description": "", "hashtags": [],
              "highlight_words": [], "reason": "Clipped by hand."}
@@ -344,12 +390,12 @@ def describe(text, title="", uploader="", game=None, timeout=None):
               + _game_rules(game)
               + RULES.format(min_len=0, max_len=0, transcript=_safe(text, 8000)))
     try:
-        out, _m, _u = ask_ai(prompt, purpose="Hand clip: title and hook", timeout=timeout)
+        out, _m, _u = ask_ai(prompt, purpose=purpose, timeout=timeout)
         if not out:
             # A quiet or half-finished moment: the answer came back empty. The viewer asked for this
             # clip by hand, so it is asked once more, plainly.
             out, _m, _u = ask_ai(prompt + "\n\nReturn one item. The moment is short; describe what was said.",
-                                 purpose="Hand clip: title and hook", timeout=timeout)
+                                 purpose=purpose, timeout=timeout)
         if not out:
             return blank
         c = _tidy(out[0], 0, 0, game)
